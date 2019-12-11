@@ -1,0 +1,4 @@
+aiohttp
+yarl
+telethon
+cryptg

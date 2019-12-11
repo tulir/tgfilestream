@@ -1,14 +1,108 @@
-from typing import Tuple, Union, AsyncIterable, cast
+from typing import Tuple, Union, AsyncIterable, AsyncGenerator, AsyncContextManager, Dict, cast
+from contextlib import asynccontextmanager
 import logging
 import asyncio
+import math
 import sys
 import os
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
+from telethon.crypto import AuthKey
+from telethon.network import MTProtoSender
+from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
+from telethon.tl.functions.upload import GetFileRequest
+from telethon.tl.types import (Document, InputFileLocation, InputDocumentFileLocation,
+                               InputPhotoFileLocation, InputPeerPhotoFileLocation)
 from telethon.tl.custom import Message
 from telethon.tl.types import TypeInputPeer, InputPeerChannel, InputPeerChat, InputPeerUser
 from aiohttp import web
 from yarl import URL
+
+TypeLocation = Union[Document, InputDocumentFileLocation, InputPeerPhotoFileLocation,
+                     InputFileLocation, InputPhotoFileLocation]
+
+
+class ParallelTransferrer:
+    log: logging.Logger = logging.getLogger("tgfilestream.transfer")
+    client: TelegramClient
+    loop: asyncio.AbstractEventLoop
+    dc_id: int
+    auth_keys: Dict[int, AuthKey]
+    connection_sem: Dict[int, asyncio.Semaphore]
+    counter: int
+
+    def __init__(self, client: TelegramClient) -> None:
+        self.client = client
+        self.loop = self.client.loop
+        self.counter = 0
+        self.auth_keys = {
+            self.client.session.dc_id: self.client.session.auth_key,
+        }
+        self.connection_sem = {
+            1: asyncio.Semaphore(value=20),
+            2: asyncio.Semaphore(value=20),
+            3: asyncio.Semaphore(value=20),
+            4: asyncio.Semaphore(value=20),
+            5: asyncio.Semaphore(value=20),
+        }
+
+    @asynccontextmanager
+    async def _with_sender(self, dc_id: int) -> AsyncContextManager[MTProtoSender]:
+        index = self.counter
+        self.counter += 1
+        async with self.connection_sem[dc_id]:
+            dc = await self.client._get_dc(dc_id)
+            sender = MTProtoSender(self.auth_keys.get(dc_id), self.loop, loggers=self.client._log)
+            self.log.debug(f"Connecting MTProtoSender {index}")
+            await sender.connect(self.client._connection(dc.ip_address, dc.port, dc.id,
+                                                         loop=self.loop, loggers=self.client._log,
+                                                         proxy=self.client._proxy))
+            if dc_id not in self.auth_keys:
+                self.log.debug(f"Exporting auth to DC {dc_id}")
+                auth = await self.client(ExportAuthorizationRequest(dc_id))
+                req = self.client._init_with(ImportAuthorizationRequest(
+                    id=auth.id, bytes=auth.bytes
+                ))
+                await sender.send(req)
+                self.auth_keys[dc_id] = sender.auth_key
+            try:
+                yield sender
+            except (GeneratorExit, StopAsyncIteration, asyncio.CancelledError):
+                pass
+            self.log.debug(f"Disconnecting MTProtoSender {index}")
+            await sender.disconnect()
+
+    def can_download(self, file: TypeLocation) -> bool:
+        dc_id, _ = utils.get_input_location(file)
+        return not self.connection_sem[dc_id].locked()
+
+    async def download(self, file: TypeLocation, file_size: int, offset: int, limit: int) -> AsyncGenerator[bytes, None]:
+        dc_id, location = utils.get_input_location(file)
+        part_size = 512 * 1024
+        first_part_cut = offset % part_size
+        first_part = math.floor(offset / part_size)
+        last_part_cut = part_size - (limit % part_size)
+        last_part = math.ceil(limit / part_size)
+        part_count = math.ceil(file_size / part_size)
+        self.log.debug(f"Starting parallel download: chunks {first_part}-{last_part}"
+                       f" of {part_count} {location!s}")
+        request = GetFileRequest(location, offset=first_part * part_size, limit=part_size)
+
+        part = first_part
+        async with self._with_sender(dc_id) as sender:
+            while part <= last_part:
+                result = await sender.send(request)
+                request.offset += part_size
+                if part == first_part:
+                    yield result.bytes[first_part_cut:]
+                elif part == last_part:
+                    yield result.bytes[:last_part_cut]
+                else:
+                    yield result.bytes
+                self.log.debug(f"Part {part}/{last_part} (total {part_count}) downloaded")
+                part += 1
+        self.log.debug("Parallel download finished")
+
 
 try:
     api_id = int(os.environ["TG_API_ID"])
@@ -34,11 +128,12 @@ pack_bits = 32
 pack_bit_mask = (1 << pack_bits) - 1
 
 client = TelegramClient(session_name, api_id, api_hash)
+transfer = ParallelTransferrer(client)
 routes = web.RouteTableDef()
 
 log = logging.getLogger("tgfilestream")
 logging.basicConfig(level=logging.DEBUG if debug else logging.INFO)
-logging.getLogger("telethon").setLevel(logging.INFO if debug else logging.ERROR)
+logging.getLogger("telethon").setLevel(logging.ERROR)
 
 group_bit = 0b01
 channel_bit = 0b10
@@ -89,15 +184,6 @@ def get_requester_ip(req: web.Request) -> str:
         return peername[0]
 
 
-async def cut_first_chunk(iterable: AsyncIterable[bytes], cut: int) -> AsyncIterable[bytes]:
-    first = True
-    async for chunk in iterable:
-        if first:
-            chunk = chunk[cut:]
-            first = False
-        yield chunk
-
-
 async def handle_request(req: web.Request, head: bool = False) -> web.Response:
     file_name = req.match_info["name"]
     file_id = int(req.match_info["id"])
@@ -109,15 +195,17 @@ async def handle_request(req: web.Request, head: bool = False) -> web.Response:
     if not message or not message.file or get_file_name(message) != file_name:
         return web.Response(status=404, text="404: Not Found")
 
-    offset = req.http_range.start or 0
-    tg_offset = offset - offset % (2 ** 19)
     size = message.file.size
+    offset = req.http_range.start or 0
+    limit = req.http_range.stop or size
 
     if not head:
+        if not transfer.can_download(message.media):
+            # TODO use per-user limits and return HTTP 429 Too Many Requests here
+            return web.Response(status=503, headers={"Retry-After": "120"})
         log.info(
             f"Serving file in {message.id} (chat {message.chat_id}) to {get_requester_ip(req)}")
-        body = client.iter_download(message.media, file_size=message.file.size, offset=tg_offset)
-        body = cut_first_chunk(body, offset - tg_offset)
+        body = transfer.download(message.media, file_size=size, offset=offset, limit=limit)
     else:
         body = None
     return web.Response(status=206 if offset else 200,
@@ -125,7 +213,7 @@ async def handle_request(req: web.Request, head: bool = False) -> web.Response:
                         headers={
                             "Content-Type": message.file.mime_type,
                             "Content-Range": f"bytes {offset}-{size}/{size}",
-                            "Content-Length": str(size - offset),
+                            "Content-Length": str(limit - offset),
                             "Content-Disposition": f'attachment; filename="{file_name}"',
                             "Accept-Ranges": "bytes",
                         })

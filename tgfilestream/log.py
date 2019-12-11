@@ -14,12 +14,13 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import logging
-import os
 
-try:
-    logging.basicConfig(filename=os.environ["LOG_CONFIG"])
-except KeyError:
-    debug = bool(os.environ.get("DEBUG"))
+from .config import log_config, debug
+
+if log_config:
+    logging.basicConfig(filename=log_config)
+else:
     logging.basicConfig(level=logging.DEBUG if debug else logging.INFO)
     logging.getLogger("telethon").setLevel(logging.INFO if debug else logging.ERROR)
+
 log = logging.getLogger("tgfilestream")

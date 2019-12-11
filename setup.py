@@ -1,5 +1,7 @@
 import setuptools
 
+from tgfilestream import __version__
+
 try:
     long_desc = open("README.md").read()
 except IOError:
@@ -7,7 +9,7 @@ except IOError:
 
 setuptools.setup(
     name="tgfilestream",
-    version="0.1.0",
+    version=__version__,
     url="https://mau.dev/tulir/tgfilestream",
 
     author="Tulir Asokan",
@@ -40,6 +42,6 @@ setuptools.setup(
     ],
     entry_points="""
         [console_scripts]
-        tgfilestream=tgfilestream:main
+        tgfilestream=tgfilestream.__main__:main
     """,
 )

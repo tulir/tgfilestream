@@ -42,3 +42,17 @@ session_name = os.environ.get("TG_SESSION_NAME", "tgfilestream")
 
 log_config = os.environ.get("LOG_CONFIG")
 debug = bool(os.environ.get("DEBUG"))
+
+try:
+    # The per-user ongoing request limit
+    request_limit = int(os.environ.get("REQUEST_LIMIT", "5"))
+except ValueError:
+    print("Please make sure the REQUEST_LIMIT environment variable is an integer")
+    sys.exit(1)
+
+try:
+    # The per-DC connection limit
+    connection_limit = int(os.environ.get("CONNECTION_LIMIT", "20"))
+except ValueError:
+    print("Please make sure the CONNECTION_LIMIT environment variable is an integer")
+    sys.exit(1)

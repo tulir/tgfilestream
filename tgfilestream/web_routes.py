@@ -13,17 +13,20 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-from typing import cast
+from typing import Dict, cast
+from collections import defaultdict
 import logging
 
 from telethon.tl.custom import Message
 from aiohttp import web
 
 from .util import unpack_id, get_file_name, get_requester_ip
+from .config import request_limit
 from .telegram import client, transfer
 
 log = logging.getLogger(__name__)
 routes = web.RouteTableDef()
+ongoing_requests: Dict[str, int] = defaultdict(lambda: 0)
 
 
 @routes.head(r"/{id:\d+}/{name}")
@@ -34,6 +37,18 @@ async def handle_head_request(req: web.Request) -> web.Response:
 @routes.get(r"/{id:\d+}/{name}")
 async def handle_get_request(req: web.Request) -> web.Response:
     return await handle_request(req, head=False)
+
+
+def allow_request(ip: str) -> None:
+    return ongoing_requests[ip] < request_limit
+
+
+def increment_counter(ip: str) -> None:
+    ongoing_requests[ip] += 1
+
+
+def decrement_counter(ip: str) -> None:
+    ongoing_requests[ip] -= 1
 
 
 async def handle_request(req: web.Request, head: bool = False) -> web.Response:
@@ -52,12 +67,10 @@ async def handle_request(req: web.Request, head: bool = False) -> web.Response:
     limit = req.http_range.stop or size
 
     if not head:
-        if not transfer.can_download(message.media):
-            # TODO use per-user limits and return HTTP 429 Too Many Requests here
-            #      Optionally maybe wait for a while instead of returning immediately
-            return web.Response(status=503, headers={"Retry-After": "120"})
-        log.info(
-            f"Serving file in {message.id} (chat {message.chat_id}) to {get_requester_ip(req)}")
+        ip = get_requester_ip(req)
+        if not allow_request(ip):
+            return web.Response(status=429)
+        log.info(f"Serving file in {message.id} (chat {message.chat_id}) to {ip}")
         body = transfer.download(message.media, file_size=size, offset=offset, limit=limit)
     else:
         body = None

@@ -27,6 +27,7 @@ from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthori
 from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import (Document, InputFileLocation, InputDocumentFileLocation,
                                InputPhotoFileLocation, InputPeerPhotoFileLocation, DcOption)
+from telethon.errors import AuthKeyUnregisteredError
 
 from .config import connection_limit
 
@@ -59,6 +60,8 @@ class DCConnectionManager:
     connections: List[Connection]
 
     _list_lock: asyncio.Lock
+    _auth_key_lock: asyncio.Lock
+    _auth_key_exports: int
 
     def __init__(self, client: TelegramClient, dc_id: int) -> None:
         self.log = root_log.getChild(f"dc{dc_id}")
@@ -67,6 +70,8 @@ class DCConnectionManager:
         self.auth_key = None
         self.connections = []
         self._list_lock = asyncio.Lock()
+        self._auth_key_lock = asyncio.Lock
+        self._auth_key_exports = 0
         self.loop = client.loop
         self.dc = None
 
@@ -82,14 +87,24 @@ class DCConnectionManager:
                                                      loop=self.loop, loggers=self.client._log,
                                                      proxy=self.client._proxy))
         if not self.auth_key:
-            self.log.info(f"Exporting auth to DC {self.dc.id} (first connection)")
+            await self.export_auth_key(sender)
+        return conn
+
+    async def export_auth_key(self, sender: MTProtoSender) -> bool:
+        self._auth_key_exports += 1
+        export_id = self._auth_key_exports
+        async with self._auth_key_lock:
+            if export_id != self._auth_key_exports:
+                sender.auth_key = self.auth_key
+                return True
+            self.log.info(f"Exporting auth to DC {self.dc.id} (export #{export_id})")
             auth = await self.client(ExportAuthorizationRequest(self.dc.id))
             req = self.client._init_with(ImportAuthorizationRequest(
                 id=auth.id, bytes=auth.bytes
             ))
             await sender.send(req)
             self.auth_key = sender.auth_key
-        return conn
+        return True
 
     async def _next_connection(self) -> Connection:
         best_conn: Optional[Connection] = None
@@ -144,10 +159,15 @@ class ParallelTransferrer:
         log = self.log
         try:
             part = first_part
-            async with self.dc_managers[dc_id].get_connection() as conn:
+            dcm = self.dc_managers[dc_id]
+            async with dcm.get_connection() as conn:
                 log = conn.log
                 while part <= last_part:
-                    result = await conn.sender.send(request)
+                    try:
+                        result = await conn.sender.send(request)
+                    except AuthKeyUnregisteredError:
+                        await dcm.export_auth_key(conn.sender)
+                        result = await conn.sender.send(request)
                     request.offset += part_size
                     if part == first_part:
                         yield result.bytes[first_part_cut:]

@@ -70,7 +70,7 @@ class DCConnectionManager:
         self.auth_key = None
         self.connections = []
         self._list_lock = asyncio.Lock()
-        self._auth_key_lock = asyncio.Lock
+        self._auth_key_lock = asyncio.Lock()
         self._auth_key_exports = 0
         self.loop = client.loop
         self.dc = None

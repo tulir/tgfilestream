@@ -17,8 +17,9 @@ import asyncio
 import sys
 
 from aiohttp import web
+from telethon import functions
 
-from .telegram import client
+from .telegram import client, transfer
 from .web_routes import routes
 from .config import host, port, public_url
 from .log import log
@@ -32,6 +33,16 @@ loop = asyncio.get_event_loop()
 
 async def start() -> None:
     await client.start()
+
+    config = await client(functions.help.GetConfigRequest())
+    for option in config.dc_options:
+        if option.ip_address == client.session.server_address:
+            if client.session.dc_id != option.id:
+                log.warning(f"Fixed DC ID in session from {client.session.dc_id} to {option.id}")
+            client.session.set_dc(option.id, option.ip_address, option.port)
+            client.session.save()
+            break
+    transfer.post_init()
 
     await runner.setup()
     await web.TCPSite(runner, host, port).start()

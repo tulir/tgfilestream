@@ -22,18 +22,17 @@ import math
 
 from telethon import TelegramClient, utils
 from telethon.crypto import AuthKey
-from telethon.network import MTProtoSender
+from telethon.network import MTProtoSender, Connection as TelegramConnection
 from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
 from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import (Document, InputFileLocation, InputDocumentFileLocation,
                                InputPhotoFileLocation, InputPeerPhotoFileLocation, DcOption)
-from telethon.errors import AuthKeyUnregisteredError
+from telethon.errors import DcIdInvalidError
 
 from .config import connection_limit
 
 TypeLocation = Union[Document, InputDocumentFileLocation, InputPeerPhotoFileLocation,
                      InputFileLocation, InputPhotoFileLocation]
-
 
 root_log = logging.getLogger(__name__)
 
@@ -46,6 +45,7 @@ if connection_limit > 25:
 class Connection:
     log: logging.Logger
     sender: MTProtoSender
+    lock: asyncio.Lock
     users: int = 0
 
 
@@ -60,8 +60,6 @@ class DCConnectionManager:
     connections: List[Connection]
 
     _list_lock: asyncio.Lock
-    _auth_key_lock: asyncio.Lock
-    _auth_key_exports: int
 
     def __init__(self, client: TelegramClient, dc_id: int) -> None:
         self.log = root_log.getChild(f"dc{dc_id}")
@@ -70,8 +68,6 @@ class DCConnectionManager:
         self.auth_key = None
         self.connections = []
         self._list_lock = asyncio.Lock()
-        self._auth_key_lock = asyncio.Lock()
-        self._auth_key_exports = 0
         self.loop = client.loop
         self.dc = None
 
@@ -80,31 +76,33 @@ class DCConnectionManager:
             self.dc = await self.client._get_dc(self.dc_id)
         sender = MTProtoSender(self.auth_key, self.loop, loggers=self.client._log)
         index = len(self.connections) + 1
-        conn = Connection(sender=sender, log=self.log.getChild(f"conn{index}"))
+        conn = Connection(sender=sender, log=self.log.getChild(f"conn{index}"), lock=asyncio.Lock())
         self.connections.append(conn)
-        conn.log.info("Connecting...")
-        await sender.connect(self.client._connection(self.dc.ip_address, self.dc.port, self.dc.id,
-                                                     loop=self.loop, loggers=self.client._log,
-                                                     proxy=self.client._proxy))
-        if not self.auth_key:
-            await self.export_auth_key(sender)
-        return conn
+        async with conn.lock:
+            conn.log.info("Connecting...")
+            connection_info = self.client._connection(self.dc.ip_address, self.dc.port, self.dc.id,
+                                                      loop=self.loop, loggers=self.client._log,
+                                                      proxy=self.client._proxy)
+            await sender.connect(connection_info)
+            if not self.auth_key:
+                await self._export_auth_key(conn)
+            return conn
 
-    async def export_auth_key(self, sender: MTProtoSender) -> bool:
-        self._auth_key_exports += 1
-        export_id = self._auth_key_exports
-        async with self._auth_key_lock:
-            if export_id != self._auth_key_exports:
-                sender.auth_key = self.auth_key
-                return True
-            self.log.info(f"Exporting auth to DC {self.dc.id} (export #{export_id})")
+    async def _export_auth_key(self, conn: Connection) -> None:
+        self.log.info(f"Exporting auth to DC {self.dc.id}"
+                      f" (main client is in {self.client.session.dc_id})")
+        try:
             auth = await self.client(ExportAuthorizationRequest(self.dc.id))
-            req = self.client._init_with(ImportAuthorizationRequest(
-                id=auth.id, bytes=auth.bytes
-            ))
-            await sender.send(req)
-            self.auth_key = sender.auth_key
-        return True
+        except DcIdInvalidError:
+            self.log.debug("Got DcIdInvalidError")
+            self.auth_key = self.client.session.auth_key
+            conn.sender.auth_key = self.auth_key
+            return
+        req = self.client._init_with(ImportAuthorizationRequest(
+            id=auth.id, bytes=auth.bytes
+        ))
+        await conn.sender.send(req)
+        self.auth_key = conn.sender.auth_key
 
     async def _next_connection(self) -> Connection:
         best_conn: Optional[Connection] = None
@@ -118,8 +116,10 @@ class DCConnectionManager:
     @asynccontextmanager
     async def get_connection(self) -> AsyncContextManager[Connection]:
         async with self._list_lock:
-            conn = await self._next_connection()
-            conn.users += 1
+            conn: Connection = await asyncio.shield(self._next_connection())
+            # The connection is locked so reconnections don't stack
+            async with conn.lock:
+                conn.users += 1
         try:
             yield conn
         finally:
@@ -146,6 +146,8 @@ class ParallelTransferrer:
             4: DCConnectionManager(client, 4),
             5: DCConnectionManager(client, 5),
         }
+
+    def post_init(self) -> None:
         self.dc_managers[self.client.session.dc_id].auth_key = self.client.session.auth_key
 
     @property
@@ -163,11 +165,7 @@ class ParallelTransferrer:
             async with dcm.get_connection() as conn:
                 log = conn.log
                 while part <= last_part:
-                    try:
-                        result = await conn.sender.send(request)
-                    except AuthKeyUnregisteredError:
-                        await dcm.export_auth_key(conn.sender)
-                        result = await conn.sender.send(request)
+                    result = await conn.sender.send(request)
                     request.offset += part_size
                     if part == first_part:
                         yield result.bytes[first_part_cut:]
@@ -180,6 +178,9 @@ class ParallelTransferrer:
                 log.debug("Parallel download finished")
         except (GeneratorExit, StopAsyncIteration, asyncio.CancelledError):
             log.debug("Parallel download interrupted")
+            raise
+        except Exception:
+            log.debug("Parallel download errored", exc_info=True)
 
     def download(self, file: TypeLocation, file_size: int, offset: int, limit: int
                  ) -> AsyncGenerator[bytes, None]:

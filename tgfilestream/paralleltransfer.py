@@ -22,7 +22,7 @@ import math
 
 from telethon import TelegramClient, utils
 from telethon.crypto import AuthKey
-from telethon.network import MTProtoSender, Connection as TelegramConnection
+from telethon.network import MTProtoSender
 from telethon.tl.functions.auth import ExportAuthorizationRequest, ImportAuthorizationRequest
 from telethon.tl.functions.upload import GetFileRequest
 from telethon.tl.types import (Document, InputFileLocation, InputDocumentFileLocation,

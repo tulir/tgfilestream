@@ -56,3 +56,6 @@ try:
 except ValueError:
     print("Please make sure the CONNECTION_LIMIT environment variable is an integer")
     sys.exit(1)
+
+
+start_message = os.environ.get("TG_START_MESG", "/start")

@@ -59,3 +59,4 @@ except ValueError:
 
 
 start_message = os.environ.get("TG_START_MESG", "Send an image or file to get a link to download it")
+group_chat_message = os.environ.get("TG_G_C_MESG", "Sorry. But, I only work in private.")

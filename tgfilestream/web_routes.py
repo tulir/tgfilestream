@@ -74,12 +74,14 @@ async def handle_request(req: web.Request, head: bool = False) -> web.Response:
         body = transfer.download(message.media, file_size=size, offset=offset, limit=limit)
     else:
         body = None
-    return web.Response(status=206 if offset else 200,
+    resp = web.Response(status=206 if offset else 200,
                         body=body,
                         headers={
                             "Content-Type": message.file.mime_type,
                             "Content-Range": f"bytes {offset}-{size}/{size}",
-                            "Content-Length": str(limit - offset),
+                            #"Content-Length": str(limit - offset),
                             "Content-Disposition": f'attachment; filename="{file_name}"',
                             "Accept-Ranges": "bytes",
                         })
+    resp.enable_chunked_encoding()
+    return resp

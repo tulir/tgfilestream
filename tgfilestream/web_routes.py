@@ -63,22 +63,27 @@ async def handle_request(req: web.Request, head: bool = False) -> web.Response:
         return web.Response(status=404, text="404: Not Found")
 
     size = message.file.size
-    offset = req.http_range.start or 0
-    limit = req.http_range.stop or size
-
+    try:
+        offset = req.http_range.start or 0
+        limit = req.http_range.stop or size
+        if (limit > size) or (offset < 0) or (limit < offset):
+            raise ValueError("range not in acceptable format")
+    except ValueError:
+        return web.Response(status=416, text="416: Range Not Satisfiable",
+                            headers={"Content-Range": f"bytes */{size}"})
     if not head:
         ip = get_requester_ip(req)
         if not allow_request(ip):
             return web.Response(status=429)
-        log.info(f"Serving file in {message.id} (chat {message.chat_id}) to {ip}")
+        log.info(f"Serving file in {message.id} (chat {message.chat_id}) to {ip}; Range: {offset} - {limit}")
         body = transfer.download(message.media, file_size=size, offset=offset, limit=limit)
     else:
         body = None
-    return web.Response(status=206 if offset else 200,
+    return web.Response(status=206 if (limit-offset != size) else 200,
                         body=body,
                         headers={
                             "Content-Type": message.file.mime_type,
-                            "Content-Range": f"bytes {offset}-{size}/{size}",
+                            "Content-Range": f"bytes {offset}-{limit}/{size}",
                             "Content-Length": str(limit - offset),
                             "Content-Disposition": f'attachment; filename="{file_name}"',
                             "Accept-Ranges": "bytes",
